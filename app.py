@@ -50,6 +50,13 @@ GROUP_CONFIG = {
         'heading': '7- Taxable supplies (Net of debit and credit notes) to unregistered persons',
         'heading_alt': '7- Taxable supplies',
         'layout': 'full',
+        # Table 7 has an extra "Document Type" text column (e.g. "Net Value")
+        # sitting between the record count and the ₹ figures, and a rate-wise
+        # breakdown (5%, 12%, 18%...) above the real total. Anchor precisely
+        # on the row that starts with "Total" followed by a record count,
+        # rather than any line merely containing the word "Total" somewhere,
+        # so a rate-wise row or stray text can't be picked up by mistake.
+        'row_pattern': r'^Total\s+[0-9]',
     },
     '8 - Nil rated, exempted and non GST outward supplies': {'type': 'table8'},
     '9A - Amended B2B Invoices': {
@@ -588,6 +595,25 @@ def build_workbook(records, template_path):
     meta['A2'].font = subtitle_font
     meta['A2'].hyperlink = 'https://pushpakkumar.com'
 
+    # Surface the GSTIN(s) found across the uploaded PDFs. If more than one
+    # distinct GSTIN is present, that's a real accuracy risk (PDFs from two
+    # different companies accidentally batched together), so flag it clearly
+    # instead of silently combining their totals.
+    gstins = sorted({r.get('gstin') for r in records if r.get('gstin')})
+    if len(gstins) == 1:
+        gstin_label = 'GSTIN'
+        gstin_value = gstins[0]
+        gstin_font = label_font
+    elif len(gstins) > 1:
+        gstin_label = 'GSTIN — WARNING'
+        gstin_value = f'{len(gstins)} different GSTINs found in this upload: ' + ', '.join(gstins) + \
+            ' — totals below mix multiple companies. Re-run with one company\'s PDFs at a time.'
+        gstin_font = Font(name='Trebuchet MS', size=10, bold=True, color='FFCC0000')
+    else:
+        gstin_label = 'GSTIN'
+        gstin_value = 'Not found in the uploaded PDF(s)'
+        gstin_font = label_font
+
     rows = [
         ('Invoice Value rule', 'Taxable Value + IGST + CGST + SGST + Cess'),
         ('Source', 'Filed GSTR-1 PDFs uploaded in the ZIP'),
@@ -596,6 +622,10 @@ def build_workbook(records, template_path):
         ('Reconciliation', 'The tool also captures the filed Total Liability and the difference against extracted taxable-outward invoice value; it does not overwrite source data.'),
     ]
     r = 4
+    meta.cell(r, 1, gstin_label).font = gstin_font
+    meta.cell(r, 2, gstin_value).font = gstin_font
+    meta.cell(r, 2).alignment = Alignment(wrap_text=True, vertical='top')
+    r += 1
     for label, body in rows:
         meta.cell(r, 1, label).font = label_font
         meta.cell(r, 2, body).font = body_font
@@ -624,62 +654,453 @@ def build_workbook(records, template_path):
 
 def main():
     import streamlit as st
-    st.set_page_config(page_title='GSTR-1 Analyzer', layout='wide')
-    st.title('GSTR-1 PDF → Excel Analyzer')
-    st.caption('Upload a ZIP of filed GSTR-1 PDFs. The analyzer maps each PDF section to the supplied Excel template.')
-    st.caption('Powered by [pushpakkumar.com](https://pushpakkumar.com)')
-    template = Path(__file__).with_name('Sample_format.xlsx')
-    zip_file = st.file_uploader('Upload ZIP containing GSTR-1 filed PDFs', type=['zip'])
+
+    st.set_page_config(
+        page_title="Pushpak Kumar | GSTR-1 Analyzer",
+        page_icon="📊",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+
+    # Professional Pushpak Kumar branding
+    st.markdown("""
+    <style>
+    .stApp { background:#f7f8fb; }
+    .main .block-container {
+        max-width:1180px;
+        padding-top:2rem;
+        padding-bottom:3rem;
+    }
+
+    .hero {
+        background:linear-gradient(135deg,#98002e 0%,#65001f 100%);
+        border-radius:20px;
+        padding:30px 34px;
+        color:#fff;
+        margin-bottom:22px;
+        box-shadow:0 10px 30px rgba(90,0,30,.16);
+    }
+
+    .brand-row {
+        display:flex;
+        align-items:center;
+        gap:12px;
+        margin-bottom:20px;
+    }
+
+    .brand-logo {
+        width:44px;
+        height:44px;
+        border-radius:12px;
+        background:rgba(255,255,255,.14);
+        border:1px solid rgba(255,255,255,.25);
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        font-size:17px;
+        font-weight:800;
+        letter-spacing:-1px;
+    }
+
+    .brand-name {
+        font-size:14px;
+        font-weight:750;
+        letter-spacing:.4px;
+        color:#fff;
+    }
+
+    .brand-tagline {
+        font-size:11px;
+        color:rgba(255,255,255,.72);
+        margin-top:2px;
+    }
+
+    .hero h1 {
+        margin:0 0 8px 0;
+        font-size:31px;
+        font-weight:750;
+        letter-spacing:-.6px;
+    }
+
+    .hero p {
+        margin:0;
+        color:rgba(255,255,255,.88);
+        font-size:14px;
+    }
+
+    .card {
+        background:#fff;
+        border:1px solid #e7e9ef;
+        border-radius:16px;
+        padding:22px;
+        margin-bottom:18px;
+        box-shadow:0 3px 14px rgba(20,20,40,.05);
+    }
+
+    .section-title {
+        font-size:18px;
+        font-weight:700;
+        color:#242733;
+        margin-bottom:4px;
+    }
+
+    .section-subtitle {
+        color:#707582;
+        font-size:13px;
+        margin-bottom:14px;
+    }
+
+    .workflow {
+        display:flex;
+        gap:10px;
+        align-items:center;
+        color:#424752;
+        font-size:13px;
+    }
+
+    .step {
+        display:flex;
+        align-items:center;
+        gap:8px;
+        flex:1;
+    }
+
+    .step-num {
+        width:28px;
+        height:28px;
+        border-radius:50%;
+        background:#f3e6eb;
+        color:#98002e;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        font-weight:750;
+    }
+
+    .workflow-line {
+        height:1px;
+        background:#dddfe6;
+        flex:1;
+    }
+
+    .status-card {
+        background:#fff;
+        border-left:4px solid #98002e;
+        border-radius:10px;
+        padding:13px 16px;
+        margin:12px 0 16px;
+        box-shadow:0 2px 9px rgba(20,20,40,.04);
+    }
+
+    .brand-chip {
+        display:inline-flex;
+        align-items:center;
+        gap:7px;
+        background:#f3e6eb;
+        color:#98002e;
+        border-radius:999px;
+        padding:6px 11px;
+        font-size:11px;
+        font-weight:750;
+        margin-bottom:11px;
+    }
+
+    .brand-dot {
+        width:6px;
+        height:6px;
+        border-radius:50%;
+        background:#98002e;
+    }
+
+    .footer {
+        text-align:center;
+        color:#858994;
+        font-size:12px;
+        padding-top:22px;
+    }
+
+    .footer-name {
+        color:#98002e;
+        font-weight:750;
+    }
+
+    div[data-testid="stFileUploader"] {
+        background:#fbfbfd;
+        border:1px dashed #c9ccd6;
+        border-radius:13px;
+        padding:8px;
+    }
+
+    .stButton > button,
+    .stDownloadButton > button {
+        border-radius:10px;
+        min-height:44px;
+        font-weight:650;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Header
+    st.markdown("""
+    <div class="hero">
+        <div class="brand-row">
+            <div class="brand-logo">PK</div>
+            <div>
+                <div class="brand-name">PUSHPAK KUMAR</div>
+                <div class="brand-tagline">GSTR-1 Analysis &amp; Reporting</div>
+            </div>
+        </div>
+        <h1>GSTR-1 PDF → Excel Analyzer</h1>
+        <p>Automate filed GSTR-1 analysis, section mapping and Excel reporting.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Workflow
+    st.markdown("""
+    <div class="card">
+        <div class="workflow">
+            <div class="step"><span class="step-num">1</span><b>Upload ZIP</b></div>
+            <div class="workflow-line"></div>
+            <div class="step"><span class="step-num">2</span><b>Analyze PDFs</b></div>
+            <div class="workflow-line"></div>
+            <div class="step"><span class="step-num">3</span><b>Download Excel</b></div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Upload
+    st.markdown("""
+    <div class="card">
+        <div class="brand-chip"><span class="brand-dot"></span> PUSHPAK KUMAR • ANALYZER</div>
+        <div class="section-title">Upload GSTR-1 files</div>
+        <div class="section-subtitle">
+            Upload a ZIP containing filed GSTR-1 PDF copies. One PDF per tax period is recommended.
+        </div>
+    """, unsafe_allow_html=True)
+
+    template = Path(__file__).with_name("Sample_format.xlsx")
+    zip_file = st.file_uploader(
+        "Upload ZIP containing GSTR-1 filed PDFs",
+        type=["zip"],
+        label_visibility="collapsed",
+    )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
     if not zip_file:
-        st.info('ZIP should contain filed GSTR-1 PDF copies. One PDF per tax period is recommended.')
+        st.info("Tip: Keep PDFs for the same GSTIN together in one ZIP for clean monthly reporting.")
+        st.markdown("""
+        <div class="footer">
+            Invoice Value = Taxable Value + IGST + CGST + SGST + Cess
+            <br><br>
+            Designed &amp; developed by <span class="footer-name">Pushpak Kumar</span>
+        </div>
+        """, unsafe_allow_html=True)
         return
 
-    if st.button('Analyze ZIP', type='primary'):
+    # Inspect ZIP before processing
+    try:
+        with zipfile.ZipFile(zip_file) as z_preview:
+            pdf_names = [
+                n for n in z_preview.namelist()
+                if n.lower().endswith(".pdf") and not n.endswith("/")
+            ]
+    except zipfile.BadZipFile:
+        st.error("The uploaded file is not a valid ZIP file.")
+        return
+
+    if not pdf_names:
+        st.error("No PDF files were found in the ZIP.")
+        return
+
+    size_mb = len(zip_file.getvalue()) / (1024 * 1024)
+
+    st.markdown(
+        f"""
+        <div class="status-card">
+            <b>Ready to analyze</b><br>
+            <span style="color:#707582;font-size:13px;">
+                {len(pdf_names)} PDF file(s) &nbsp; • &nbsp; {size_mb:.2f} MB
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.button("🔍  Analyze GSTR-1 ZIP", type="primary", use_container_width=True):
         records = []
         errors = []
+
+        progress = st.progress(0, text="Starting analysis…")
+        status = st.empty()
+
+        total_files = len(pdf_names)
+
         with zipfile.ZipFile(zip_file) as z:
-            pdf_names = [n for n in z.namelist() if n.lower().endswith('.pdf') and not n.endswith('/')]
-            if not pdf_names:
-                st.error('No PDF files found in the ZIP.')
-                return
-            for name in pdf_names:
+            for i, name in enumerate(pdf_names, start=1):
+                status.markdown(
+                    f"**Processing {i} of {total_files}:** `{Path(name).name}`"
+                )
+
                 try:
                     d = extract_pdf(z.read(name))
-                    if not d.get('month'):
-                        raise ValueError('Could not identify Financial Year / Tax Period')
-                    d['file_name'] = name
+
+                    if not d.get("month"):
+                        raise ValueError(
+                            "Could not identify Financial Year / Tax Period"
+                        )
+
+                    d["file_name"] = name
                     records.append(d)
+
                 except Exception as exc:
                     errors.append((name, str(exc)))
 
-        st.success(f'Parsed {len(records)} of {len(pdf_names)} PDF(s).')
+                progress.progress(
+                    i / total_files,
+                    text=f"Analyzing PDF {i} of {total_files}",
+                )
+
+        progress.progress(1.0, text="Analysis complete ✓")
+        status.empty()
+
         if errors:
-            st.warning('Some files could not be parsed.')
-            st.dataframe([{'File': n, 'Error': e} for n, e in errors], use_container_width=True)
+            st.warning(f"{len(errors)} file(s) could not be parsed.")
+            with st.expander("View parsing errors"):
+                st.dataframe(
+                    [{"File": n, "Error": e} for n, e in errors],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-        if records:
-            preview = []
-            for r in records:
-                preview.append({
-                    'Month': r['month'].strftime('%b-%y') if r.get('month') else '',
-                    'GSTIN': r.get('gstin'),
-                    'Tax Period': r.get('tax_period'),
-                    'Financial Year': r.get('fy'),
-                    'File': r['file_name'],
-                })
-            st.dataframe(preview, use_container_width=True)
+        if not records:
+            st.error("No GSTR-1 PDFs could be successfully parsed.")
+            return
 
-            wb = build_workbook(records, str(template))
-            out = io.BytesIO()
-            wb.save(out)
-            out.seek(0)
-            st.download_button(
-                'Download Excel',
-                out.getvalue(),
-                file_name='GSTR1_Analyzed.xlsx',
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        st.success(
+            f"Successfully parsed {len(records)} of {len(pdf_names)} PDF(s)."
+        )
+
+        # Summary cards
+        gstins = sorted(
+            {r.get("gstin") for r in records if r.get("gstin")}
+        )
+        fys = sorted(
+            {r.get("fy") for r in records if r.get("fy")}
+        )
+
+        a, b, c = st.columns(3)
+        with a:
+            st.metric("PDFs Parsed", len(records))
+        with b:
+            st.metric("GSTINs Found", len(gstins))
+        with c:
+            st.metric("Financial Year(s)", len(fys))
+
+        if len(gstins) > 1:
+            st.warning(
+                "Multiple GSTINs were found in this ZIP. For clean reporting, "
+                "analyze one GSTIN at a time."
             )
 
+        # Period preview
+        st.markdown(
+            """
+            <div class="section-title" style="margin-top:22px;">
+                Extracted periods
+            </div>
+            <div class="section-subtitle">
+                Review the detected tax periods before downloading.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-if __name__ == '__main__':
+        preview = []
+        for r in sorted(
+            records,
+            key=lambda x: x["month"] or datetime.max
+        ):
+            preview.append({
+                "Month": r["month"].strftime("%b-%y")
+                    if r.get("month") else "",
+                "GSTIN": r.get("gstin"),
+                "Tax Period": r.get("tax_period"),
+                "Financial Year": r.get("fy"),
+                "File": Path(r["file_name"]).name,
+            })
+
+        st.dataframe(
+            preview,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Excel build progress
+        build_progress = st.progress(
+            0,
+            text="Preparing Excel workbook…"
+        )
+
+        build_progress.progress(
+            25,
+            text="Loading Excel template…"
+        )
+
+        build_progress.progress(
+            50,
+            text="Applying GSTR-1 mappings…"
+        )
+
+        wb = build_workbook(records, str(template))
+
+        build_progress.progress(
+            75,
+            text="Creating extraction audit trail…"
+        )
+
+        out = io.BytesIO()
+        wb.save(out)
+        out.seek(0)
+
+        build_progress.progress(
+            100,
+            text="Excel report ready ✓"
+        )
+
+        st.markdown(
+            """
+            <div class="card">
+                <div class="section-title">Your report is ready</div>
+                <div class="section-subtitle">
+                    The workbook includes the mapped report, Extraction Audit
+                    and Read Me sheets.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.download_button(
+            "⬇️  Download GSTR1_Analyzed.xlsx",
+            out.getvalue(),
+            file_name="GSTR1_Analyzed.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            type="primary",
+        )
+
+    st.markdown("""
+    <div class="footer">
+        GSTR-1 PDF → Excel Analyzer
+        &nbsp; • &nbsp;
+        Invoice Value = Taxable Value + IGST + CGST + SGST + Cess
+        <br><br>
+        Designed &amp; developed by
+        <span class="footer-name">Pushpak Kumar</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+if __name__ == "__main__":
     main()
