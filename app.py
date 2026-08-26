@@ -315,6 +315,22 @@ def extract_pdf(pdf_bytes):
         except Exception:
             month = None
 
+    # IMPORTANT: Do NOT use a plain '\bNIL\b' search here. Normal GSTR-1
+    # filed PDFs contain the words 'Nil rated' / 'Nil' in Table 8 even when
+    # the return is NOT a NIL return. That old check therefore marked every
+    # PDF as NIL.
+    #
+    # We first look for an explicit NIL-return marker. If the filed PDF has no
+    # explicit marker, we later classify it as NIL only when every mapped
+    # section is genuinely zero (no records and no values).
+    filename_hint = ''
+    explicit_nil = bool(re.search(
+        r'(?:NIL\s+RETURN|RETURN\s+TYPE\s*[:\-]?\s*NIL|FILING\s+TYPE\s*[:\-]?\s*NIL|STATUS\s*[:\-]?\s*NIL)',
+        text,
+        re.I,
+    ))
+    is_nil = explicit_nil
+
     data = {
         'fy': fy.group(1) if fy else None,
         'tax_period': tp.group(1) if tp else None,
@@ -322,6 +338,8 @@ def extract_pdf(pdf_bytes):
         'arn': arn.group(1) if arn else None,
         'arn_date': arn_date.group(1) if arn_date else None,
         'month': month,
+        'is_nil': is_nil,
+        'filing_status': 'NIL FILED' if is_nil else 'FILED',
         'sections': {},
         'audit': [],
     }
@@ -375,6 +393,31 @@ def extract_pdf(pdf_bytes):
         if line:
             data['audit'].append((group, line, heading))
 
+    # If the PDF does not contain an explicit NIL marker, classify it as a
+    # NIL filing only when the extracted GSTR-1 summary is completely zero.
+    # This is safe for a genuine NIL GSTR-1 and, crucially, avoids treating
+    # the ordinary 'Nil rated' wording in Table 8 as a NIL-return marker.
+    if not is_nil:
+        has_records = False
+        has_values = False
+        for section in data['sections'].values():
+            if not isinstance(section, dict):
+                continue
+            if (section.get('records', 0) or 0) != 0:
+                has_records = True
+                break
+            for key in ('taxable', 'igst', 'cgst', 'sgst', 'cess', 'invoice', 'nil', 'exempted', 'non_gst'):
+                if abs(float(section.get(key, 0) or 0)) > 0.000001:
+                    has_values = True
+                    break
+            if has_values:
+                break
+        if not has_records and not has_values:
+            is_nil = True
+
+    data['is_nil'] = is_nil
+    data['filing_status'] = 'NIL FILED' if is_nil else 'FILED'
+
     # Filed-copy reconciliation: Table 6A total should agree with the final
     # outward-supply liability when no other taxable outward tables contain
     # values. Keep this as an audit flag rather than changing extracted data.
@@ -391,6 +434,19 @@ def extract_pdf(pdf_bytes):
         '6A_invoice_value': six_a.get('invoice', 0.0),
         'difference': (total_liability - six_a.get('invoice', 0.0)) if total_liability is not None else None,
     }
+
+    # For a NIL-filed month, explicitly zero every mapped section. This makes
+    # the month appear in the same report with zero values instead of being
+    # mistaken for a missing month.
+    if is_nil:
+        for key in list(data['sections']):
+            data['sections'][key] = zero()
+        data['total_liability'] = 0.0
+        data['reconciliation'] = {
+            'total_liability': 0.0,
+            '6A_invoice_value': 0.0,
+            'difference': 0.0,
+        }
 
     return data
 
@@ -454,93 +510,215 @@ def write_group_row(ws, row, group, d):
         ws.cell(row, c).value = value
 
 
+STATE_CODES = {
+    '01': 'Jammu & Kashmir', '02': 'Himachal Pradesh', '03': 'Punjab',
+    '04': 'Chandigarh', '05': 'Uttarakhand', '06': 'Haryana',
+    '07': 'Delhi', '08': 'Rajasthan', '09': 'Uttar Pradesh',
+    '10': 'Bihar', '11': 'Sikkim', '12': 'Arunachal Pradesh',
+    '13': 'Nagaland', '14': 'Manipur', '15': 'Mizoram',
+    '16': 'Tripura', '17': 'Meghalaya', '18': 'Assam',
+    '19': 'West Bengal', '20': 'Jharkhand', '21': 'Odisha',
+    '22': 'Chhattisgarh', '23': 'Madhya Pradesh', '24': 'Gujarat',
+    '25': 'Daman & Diu', '26': 'Dadra & Nagar Haveli and Daman & Diu',
+    '27': 'Maharashtra', '28': 'Andhra Pradesh', '29': 'Karnataka',
+    '30': 'Goa', '31': 'Lakshadweep', '32': 'Kerala',
+    '33': 'Tamil Nadu', '34': 'Puducherry', '35': 'Andaman & Nicobar Islands',
+    '36': 'Telangana', '37': 'Andhra Pradesh', '38': 'Ladakh',
+    '97': 'Other Territory',
+}
+
+
+def state_from_gstin(gstin):
+    gstin = str(gstin or '').strip().upper()
+    code = gstin[:2] if len(gstin) >= 2 else ''
+    return STATE_CODES.get(code, f'Unknown / Code {code}' if code else 'Unknown State')
+
+
+def copy_row_style_all(ws, source_row, target_row):
+    copy_row_style(ws, source_row, target_row)
+
+
+def style_section_row(ws, row, text, fill_color='FFEFE2E7'):
+    max_col = ws.max_column
+    for c in range(1, max_col + 1):
+        cell = ws.cell(row, c)
+        cell.fill = PatternFill(fill_type='solid', fgColor=fill_color)
+        cell.font = Font(name='Trebuchet MS', size=10, bold=True, color='FF98002E')
+        cell.alignment = Alignment(vertical='center')
+        cell.border = Border(bottom=Side(style='thin', color='FFD0B5BF'))
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=max_col)
+    ws.cell(row, 1).value = text
+    ws.cell(row, 1).font = Font(name='Trebuchet MS', size=11, bold=True, color='FF98002E')
+    ws.cell(row, 1).alignment = Alignment(vertical='center')
+    ws.row_dimensions[row].height = 23
+
+
+def add_total_style(ws, row, label='Total'):
+    total_font = Font(name='Trebuchet MS', size=10, bold=True, color='FF98002E')
+    total_fill = PatternFill(fill_type='solid', fgColor='FFF2E2E6')
+    top = Side(style='double', color='FF98002E')
+    for c in range(1, ws.max_column + 1):
+        cell = ws.cell(row, c)
+        cell.font = total_font
+        cell.fill = total_fill
+        cell.border = Border(top=top, bottom=cell.border.bottom, left=cell.border.left, right=cell.border.right)
+    ws.cell(row, 1).value = label
+    ws.cell(row, 2).value = None
+
+
+def normalize_workbook_fonts(wb):
+    """Apply the requested workbook-wide font standard without changing styling.
+
+    Every cell in every worksheet uses Trebuchet MS at exactly 10 pt. Existing
+    bold/italic/underline/color/etc. attributes are preserved.
+    """
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.font:
+                    cell.font = cell.font.copy(name="Trebuchet MS", size=10)
+
+
 def build_workbook(records, template_path):
     wb, ws, groups, month_col = load_template(template_path)
 
-    # Clear old data rows but preserve the template headers/formatting.
+    # Clear old data rows but preserve template headers/formatting.
     start_row = 5
     old_max_row = ws.max_row
     for r in range(start_row, old_max_row + 1):
         for c in range(1, ws.max_column + 1):
             ws.cell(r, c).value = None
 
+    # Keep the original template columns exactly where they are.
+    # Column A is used for GSTIN/registration, B remains Month, and the
+    # Filing Status column is appended after the existing GSTR-1 groups.
+    # Do NOT insert a column here: openpyxl does not reliably shift merged
+    # header ranges when insert_cols() is used, which breaks the template
+    # header alignment.
+    ws.cell(3, 1).value = 'GSTIN / Registration'
+    ws.cell(4, 1).value = 'GSTIN'
+    ws.cell(3, 1).font = Font(name='Trebuchet MS', size=10, bold=True, color='FFFFFFFF')
+    ws.cell(4, 1).font = Font(name='Trebuchet MS', size=10, bold=True, color='FFFFFFFF')
+    ws.column_dimensions['A'].width = 24
+
+    # Append status after the final existing GSTR-1 section so every original
+    # template header/group remains perfectly aligned.
+    status_col = max(ws.max_column, max((g['end'] for g in groups), default=month_col)) + 1
+    ws.cell(3, status_col).value = 'Filing Status'
+    ws.cell(4, status_col).value = 'Status'
+    for rr in (3, 4):
+        cell = ws.cell(rr, status_col)
+        cell.font = Font(name='Trebuchet MS', size=10, bold=True, color='FFFFFFFF')
+        cell.fill = PatternFill(fill_type='solid', fgColor='FF98002E')
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    ws.column_dimensions[get_column_letter(status_col)].width = 16
+
+    enriched = []
+    for rec in records:
+        gstin = rec.get('gstin') or 'GSTIN Not Found'
+        enriched.append({**rec, 'gstin_display': gstin, 'state': state_from_gstin(rec.get('gstin'))})
+
+    state_order = {}
+    for rec in enriched:
+        state_order.setdefault(rec['state'], []).append(rec)
+    state_order = dict(sorted(state_order.items(), key=lambda kv: kv[0]))
+
     row = start_row
     audit_rows = []
-    for rec in sorted(records, key=lambda x: x['month'] or datetime.max):
+    data_rows_by_state = {}
+
+    # Helper for numeric formatting.
+    number_fmt = '#,##0.00;[RED]-#,##0.00'
+    count_fmt = '#,##0'
+
+    for state, state_records in state_order.items():
+        # State separator row.
         if row > start_row:
-            copy_row_style(ws, start_row, row)
-        # Write the month as a real Excel date so it sorts/filters correctly
-        # and displays via the template's own accounting-style "mmm-yy"
-        # format (e.g. Apr-25) rather than as plain text.
-        month_date = rec.get('month')
-        ws.cell(row, month_col).value = month_date if month_date else None
-        ws.cell(row, month_col).number_format = 'mmm-yy'
-
-        for g in groups:
-            d = rec['sections'].get(g['title'], zero())
-            write_group_row(ws, row, g, d)
-
-        for group, source_line, heading in rec.get('audit', []):
-            audit_rows.append([
-                rec.get('file_name', ''),
-                rec.get('tax_period', ''),
-                group,
-                heading,
-                source_line,
-            ])
+            row += 1
+        state_header_row = row
+        copy_row_style(ws, start_row, row)
+        style_section_row(ws, row, f'{state}  •  {len({r["gstin_display"] for r in state_records})} registration(s)')
         row += 1
 
+        # Keep each registration distinct inside the state block.
+        gstin_groups = {}
+        for rec in state_records:
+            gstin_groups.setdefault(rec['gstin_display'], []).append(rec)
+
+        state_data_start = row
+        for gstin, gstin_records in sorted(gstin_groups.items(), key=lambda kv: kv[0]):
+            for rec in sorted(gstin_records, key=lambda x: x['month'] or datetime.max):
+                if row > start_row:
+                    copy_row_style(ws, start_row, row)
+                ws.cell(row, 1).value = gstin
+                ws.cell(row, 2).value = rec.get('month')
+                ws.cell(row, month_col).number_format = 'mmm-yy'
+                ws.cell(row, status_col).value = rec.get('filing_status', 'FILED')
+
+                for g in groups:
+                    d = rec['sections'].get(g['title'], zero())
+                    write_group_row(ws, row, g, d)
+                    for i, header in enumerate(g['headers']):
+                        c = g['start'] + i
+                        h = header.strip().lower()
+                        if isinstance(ws.cell(row, c).value, (int, float)):
+                            ws.cell(row, c).number_format = count_fmt if h.startswith('no. of records') else number_fmt
+
+                for group, source_line, heading in rec.get('audit', []):
+                    audit_rows.append([
+                        rec.get('file_name', ''), rec.get('gstin', ''), rec.get('state', ''),
+                        rec.get('tax_period', ''), group, heading, source_line,
+                    ])
+                row += 1
+
+        state_data_end = row - 1
+        data_rows_by_state[state] = (state_data_start, state_data_end)
+
+        # State total row.
+        state_total_row = row
+        if state_data_end >= state_data_start:
+            copy_row_style(ws, start_row, row)
+            for c in range(1, ws.max_column + 1):
+                h = (ws.cell(4, c).value or '').strip().lower()
+                if c == 1:
+                    ws.cell(row, c).value = f'{state} Total'
+                elif c in (month_col, status_col):
+                    ws.cell(row, c).value = None
+                else:
+                    vals = [ws.cell(rr, c).value for rr in range(state_data_start, state_data_end + 1)]
+                    total = sum(v for v in vals if isinstance(v, (int, float)))
+                    ws.cell(row, c).value = int(total) if h.startswith('no. of records') else total
+                    ws.cell(row, c).number_format = count_fmt if h.startswith('no. of records') else number_fmt
+            add_total_style(ws, row, f'{state} Total')
+        row += 1
+
+    # Grand total across every state/registration.
     total_row = row
     if records:
         copy_row_style(ws, start_row, total_row)
-    ws.cell(total_row, month_col).value = 'Total'
-    ws.cell(total_row, month_col).number_format = '@'
+    ws.cell(total_row, 1).value = 'GRAND TOTAL – ALL STATES / REGISTRATIONS'
+    ws.cell(total_row, month_col).value = None
+    ws.cell(total_row, status_col).value = None
 
-    # Total each output column, including record counts and Table 8 values.
+    # Sum only the actual data rows (not state headers or state totals) to avoid double counting.
+    all_data_rows = []
+    for state, (s, e) in data_rows_by_state.items():
+        all_data_rows.extend(range(s, e + 1))
     for g in groups:
         for i, header in enumerate(g['headers']):
             c = g['start'] + i
             h = header.strip().lower()
-            if h == 'month':
-                continue
             total = 0.0
-            for r in range(start_row, total_row):
-                v = ws.cell(r, c).value
+            for rr in all_data_rows:
+                v = ws.cell(rr, c).value
                 if isinstance(v, (int, float)):
                     total += v
             ws.cell(total_row, c).value = int(total) if h.startswith('no. of records') else total
+            ws.cell(total_row, c).number_format = count_fmt if h.startswith('no. of records') else number_fmt
+    add_total_style(ws, total_row, 'GRAND TOTAL – ALL STATES / REGISTRATIONS')
 
-    # --- Professional styling ------------------------------------------------
-    # Make the Total row stand out: bold text, a heavier top border, and a
-    # light highlight fill that complements the template's maroon header.
-    if records:
-        total_font = Font(name='Trebuchet MS', size=10, bold=True, color='FF98002E')
-        total_fill = PatternFill(fill_type='solid', fgColor='FFF2E2E6')
-        top_border = Border(top=Side(style='double', color='FF98002E'))
-        for c in range(1, ws.max_column + 1):
-            cell = ws.cell(total_row, c)
-            cell.font = total_font
-            cell.fill = total_fill
-            cell.border = Border(
-                top=top_border.top,
-                bottom=cell.border.bottom,
-                left=cell.border.left,
-                right=cell.border.right,
-            )
-
-    # Right-align + apply thousands separators to numeric data cells so large
-    # figures are easy to scan, and keep column widths readable.
-    number_fmt = '#,##0.00;[RED]-#,##0.00'
-    count_fmt = '#,##0'
+    # Format all group columns and keep the template's widths readable.
     for g in groups:
-        for i, header in enumerate(g['headers']):
-            c = g['start'] + i
-            h = header.strip().lower()
-            fmt = count_fmt if h.startswith('no. of records') else number_fmt
-            for r in range(start_row, total_row + 1):
-                cell = ws.cell(r, c)
-                if isinstance(cell.value, (int, float)):
-                    cell.number_format = fmt
         width = 16 if any('value' in h.lower() for h in g['headers']) else 13
         for c in range(g['start'], g['end'] + 1):
             ws.column_dimensions[get_column_letter(c)].width = max(
@@ -548,24 +726,19 @@ def build_workbook(records, template_path):
             )
     ws.column_dimensions[get_column_letter(month_col)].width = 12
 
-    # The template ships with 12 pre-formatted blank month rows plus its own
-    # leftover "Total" row/fill. Once we've written the real Total row,
-    # remove any now-unused template rows below it so the sheet doesn't show
-    # stray empty bordered rows or an orphaned Total-style band underneath.
     if old_max_row > total_row:
         ws.delete_rows(total_row + 1, old_max_row - total_row)
 
     ws.freeze_panes = f'{get_column_letter(month_col + 1)}{start_row}'
     ws.auto_filter.ref = (
-        f'{get_column_letter(month_col)}4:{get_column_letter(ws.max_column)}{total_row}'
+        f'A4:{get_column_letter(ws.max_column)}{total_row}'
     )
 
-    # Add a transparent audit sheet so every extracted value can be traced back
-    # to the exact source row in the filed GSTR-1 PDF.
+    # Extraction Audit.
     if 'Extraction Audit' in wb.sheetnames:
         del wb['Extraction Audit']
     audit = wb.create_sheet('Extraction Audit')
-    headers = ['PDF File', 'Tax Period', 'Excel Group', 'GSTR-1 Section', 'Source Row']
+    headers = ['PDF File', 'GSTIN', 'State', 'Tax Period', 'Excel Group', 'GSTR-1 Section', 'Source Row']
     for c, h in enumerate(headers, start=1):
         audit.cell(1, c).value = h
         audit.cell(1, c).font = Font(bold=True)
@@ -573,10 +746,37 @@ def build_workbook(records, template_path):
         for c_idx, value in enumerate(values, start=1):
             audit.cell(r_idx, c_idx).value = value
     audit.freeze_panes = 'A2'
-    audit.auto_filter.ref = f'A1:E{max(1, len(audit_rows)+1)}'
-    for col, width in {'A':35, 'B':15, 'C':45, 'D':70, 'E':90}.items():
+    audit.auto_filter.ref = f'A1:G{max(1, len(audit_rows)+1)}'
+    for col, width in {'A':35, 'B':20, 'C':28, 'D':15, 'E':45, 'F':70, 'G':90}.items():
         audit.column_dimensions[col].width = width
 
+    # Filing Status sheet: one row per uploaded filing, including NIL months.
+    if 'Filing Status' in wb.sheetnames:
+        del wb['Filing Status']
+    filing = wb.create_sheet('Filing Status')
+    filing_headers = ['GSTIN', 'State', 'Month', 'Tax Period', 'Financial Year', 'Filing Status', 'PDF File']
+    for c, h in enumerate(filing_headers, start=1):
+        filing.cell(1, c).value = h
+        filing.cell(1, c).font = Font(bold=True)
+    for r_idx, rec in enumerate(sorted(records, key=lambda x: ((x.get('gstin') or ''), x.get('month') or datetime.max)), start=2):
+        values = [
+            rec.get('gstin'),
+            rec.get('state') or state_from_gstin(rec.get('gstin')),
+            rec.get('month'),
+            rec.get('tax_period'),
+            rec.get('fy'),
+            rec.get('filing_status', 'FILED'),
+            Path(rec.get('file_name', '')).name,
+        ]
+        for c, value in enumerate(values, start=1):
+            filing.cell(r_idx, c).value = value
+        filing.cell(r_idx, 3).number_format = 'mmm-yy'
+    filing.freeze_panes = 'A2'
+    filing.auto_filter.ref = f'A1:G{max(1, len(records)+1)}'
+    for col, width in {'A':20, 'B':25, 'C':12, 'D':15, 'E':15, 'F':16, 'G':45}.items():
+        filing.column_dimensions[col].width = width
+
+    # Read Me.
     if 'Read Me' in wb.sheetnames:
         del wb['Read Me']
     meta = wb.create_sheet('Read Me', 0)
@@ -595,35 +795,27 @@ def build_workbook(records, template_path):
     meta['A2'].font = subtitle_font
     meta['A2'].hyperlink = 'https://pushpakkumar.com'
 
-    # Surface the GSTIN(s) found across the uploaded PDFs. If more than one
-    # distinct GSTIN is present, that's a real accuracy risk (PDFs from two
-    # different companies accidentally batched together), so flag it clearly
-    # instead of silently combining their totals.
     gstins = sorted({r.get('gstin') for r in records if r.get('gstin')})
-    if len(gstins) == 1:
-        gstin_label = 'GSTIN'
-        gstin_value = gstins[0]
-        gstin_font = label_font
-    elif len(gstins) > 1:
-        gstin_label = 'GSTIN — WARNING'
-        gstin_value = f'{len(gstins)} different GSTINs found in this upload: ' + ', '.join(gstins) + \
-            ' — totals below mix multiple companies. Re-run with one company\'s PDFs at a time.'
-        gstin_font = Font(name='Trebuchet MS', size=10, bold=True, color='FFCC0000')
+    states = sorted({state_from_gstin(r.get('gstin')) for r in records})
+    gstin_label = 'GSTINs / Registrations'
+    if gstins:
+        gstin_value = f'{len(gstins)} registration(s): ' + ', '.join(gstins)
     else:
-        gstin_label = 'GSTIN'
         gstin_value = 'Not found in the uploaded PDF(s)'
-        gstin_font = label_font
 
     rows = [
+        ('States', f'{len(states)} state(s): ' + ', '.join(states)),
         ('Invoice Value rule', 'Taxable Value + IGST + CGST + SGST + Cess'),
         ('Source', 'Filed GSTR-1 PDFs uploaded in the ZIP'),
+        ('Grouping', 'Main sheet is grouped State-wise, then GSTIN-wise, then Month-wise. NIL-filed months are retained with zero values and marked NIL FILED. Each state has its own subtotal followed by one Grand Total for all states/registrations.'),
+        ('NIL filing rule', 'A NIL GSTR-1 PDF is treated as a valid filing. The month is included in the report, Filing Status is marked NIL FILED, and all mapped values are explicitly set to zero.'),
         ('Mapping rule', 'Each Excel group is mapped to a specific GSTR-1 section/row. The PDF Value field is treated as Taxable Value.'),
-        ('Audit', 'Extraction Audit sheet records the exact source row used for each mapped section.'),
-        ('Reconciliation', 'The tool also captures the filed Total Liability and the difference against extracted taxable-outward invoice value; it does not overwrite source data.'),
+        ('Audit', 'Extraction Audit records the exact source row used for each mapped section, along with GSTIN and State.'),
+        ('Reconciliation', 'The tool captures the filed Total Liability and the difference against extracted taxable-outward invoice value; it does not overwrite source data.'),
     ]
     r = 4
-    meta.cell(r, 1, gstin_label).font = gstin_font
-    meta.cell(r, 2, gstin_value).font = gstin_font
+    meta.cell(r, 1, gstin_label).font = label_font
+    meta.cell(r, 2, gstin_value).font = body_font
     meta.cell(r, 2).alignment = Alignment(wrap_text=True, vertical='top')
     r += 1
     for label, body in rows:
@@ -637,17 +829,19 @@ def build_workbook(records, template_path):
     link_cell = meta.cell(r, 2, 'pushpakkumar.com')
     link_cell.font = link_font
     link_cell.hyperlink = 'https://pushpakkumar.com'
-
-    meta.column_dimensions['A'].width = 20
-    meta.column_dimensions['B'].width = 90
+    meta.column_dimensions['A'].width = 24
+    meta.column_dimensions['B'].width = 100
     for rr in range(4, r + 1):
         meta.row_dimensions[rr].height = 18
 
-    # Small branded banner on the main data sheet header area so the
-    # workbook is clearly attributed wherever it's opened/printed.
     ws['A1'] = 'pushpakkumar.com'
-    ws['A1'].font = Font(name='Trebuchet MS', size=9, italic=True, color='FF98002E')
+    ws['A1'].font = Font(name='Trebuchet MS', size=10, italic=True, color='FF98002E')
     ws['A1'].hyperlink = 'https://pushpakkumar.com'
+
+    # Final workbook-wide typography pass: every sheet/cell is Trebuchet MS,
+    # 10 pt. This also normalizes fonts inherited from the original template
+    # and fonts created by the audit/status/read-me sheets above.
+    normalize_workbook_fonts(wb)
 
     return wb
 
@@ -874,7 +1068,7 @@ def main():
         <div class="brand-chip"><span class="brand-dot"></span> PUSHPAK KUMAR • ANALYZER</div>
         <div class="section-title">Upload GSTR-1 files</div>
         <div class="section-subtitle">
-            Upload a ZIP containing filed GSTR-1 PDF copies. One PDF per tax period is recommended.
+            Upload a ZIP containing filed GSTR-1 PDF copies from one or more GST registrations. The report is grouped state-wise, then registration-wise, then month-wise.
         </div>
     """, unsafe_allow_html=True)
 
@@ -888,7 +1082,7 @@ def main():
     st.markdown("</div>", unsafe_allow_html=True)
 
     if not zip_file:
-        st.info("Tip: Keep PDFs for the same GSTIN together in one ZIP for clean monthly reporting.")
+        st.info("Tip: You can upload multiple registrations in one ZIP. The Excel report will group them State-wise and provide state subtotals plus one Grand Total.")
         st.markdown("""
         <div class="footer">
             Invoice Value = Taxable Value + IGST + CGST + SGST + Cess
@@ -945,6 +1139,22 @@ def main():
                 try:
                     d = extract_pdf(z.read(name))
 
+                    # Some downloaded NIL copies are named with NIL in the
+                    # filename. Treat that as an additional explicit marker,
+                    # but never infer NIL merely because the PDF contains the
+                    # word "Nil" (Table 8 routinely does).
+                    if re.search(r'(^|[_\- .])NIL([_\- .]|$)', Path(name).stem, re.I):
+                        d['is_nil'] = True
+                        d['filing_status'] = 'NIL FILED'
+                        for key in list(d.get('sections', {})):
+                            d['sections'][key] = zero()
+                        d['total_liability'] = 0.0
+                        d['reconciliation'] = {
+                            'total_liability': 0.0,
+                            '6A_invoice_value': 0.0,
+                            'difference': 0.0,
+                        }
+
                     if not d.get("month"):
                         raise ValueError(
                             "Could not identify Financial Year / Tax Period"
@@ -998,9 +1208,8 @@ def main():
             st.metric("Financial Year(s)", len(fys))
 
         if len(gstins) > 1:
-            st.warning(
-                "Multiple GSTINs were found in this ZIP. For clean reporting, "
-                "analyze one GSTIN at a time."
+            st.info(
+                "Multiple GSTINs detected. The Excel report will automatically group them State-wise, then GSTIN-wise, with state subtotals and one Grand Total."
             )
 
         # Period preview
@@ -1027,6 +1236,7 @@ def main():
                 "GSTIN": r.get("gstin"),
                 "Tax Period": r.get("tax_period"),
                 "Financial Year": r.get("fy"),
+                "Status": r.get("filing_status", "FILED"),
                 "File": Path(r["file_name"]).name,
             })
 
